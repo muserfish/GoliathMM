@@ -727,12 +727,23 @@ namespace TrueMarketMaking
         {
             try
             {
-                var gp = Core.Instance?.Positions?.FirstOrDefault(p =>
-                    p != null && AccountsEqual(p.Account, this.account) && SymbolsEqual(p.Symbol, this.symbol));
-                if (gp != null) return (int)Math.Round(gp.Quantity);
-                else if (debugLogs) D("POS base: no matching position (by Id) — fallback to manual netPosition.");
+                var positions = Core.Instance?.Positions?.ToArray();
+                if (positions != null)
+                {
+                    var matches = positions
+                        .Where(p => p != null && AccountsEqual(p.Account, this.account) && SymbolsEqual(p.Symbol, this.symbol))
+                        .ToArray();
+
+                    if (matches.Length > 0)
+                    {
+                        var totalQuantity = matches.Sum(p => p.Quantity);
+                        return (int)Math.Round(totalQuantity);
+                    }
+                }
+
+                if (debugLogs) D("POS base: no matching position (by Id) — fallback to manual netPosition.");
             }
-            catch (Exception ex) { if (debugLogs) D($"POS base: exception {ex.Message}"); }
+            catch (Exception ex) { if (debugLogs) D($"POS base: exception while reading positions snapshot: {ex.Message}"); }
             return this.netPosition;
         }
 
@@ -740,13 +751,23 @@ namespace TrueMarketMaking
         {
             try
             {
-                var hp = Core.Instance?.Positions?.FirstOrDefault(p =>
-                    p != null && AccountsEqual(p.Account, this.account) &&
-                    this.hedgeSymbol != null && SymbolsEqual(p.Symbol, this.hedgeSymbol));
-                if (hp != null) return (int)Math.Round(hp.Quantity);
-                else if (debugLogs) D("POS hedge: no matching hedge position (by Id).");
+                var positions = Core.Instance?.Positions?.ToArray();
+                if (positions != null && this.hedgeSymbol != null)
+                {
+                    var matches = positions
+                        .Where(p => p != null && AccountsEqual(p.Account, this.account) && SymbolsEqual(p.Symbol, this.hedgeSymbol))
+                        .ToArray();
+
+                    if (matches.Length > 0)
+                    {
+                        var totalQuantity = matches.Sum(p => p.Quantity);
+                        return (int)Math.Round(totalQuantity);
+                    }
+                }
+
+                if (debugLogs) D("POS hedge: no matching hedge position (by Id).");
             }
-            catch (Exception ex) { if (debugLogs) D($"POS hedge: exception {ex.Message}"); }
+            catch (Exception ex) { if (debugLogs) D($"POS hedge: exception while reading positions snapshot: {ex.Message}"); }
             return 0;
         }
 
