@@ -795,6 +795,7 @@ namespace Quantower.Strategies
             private readonly HashSet<string> _openClientOrderIds = new(StringComparer.Ordinal);
             private readonly Dictionary<string, OrderSide> _clientOrderSides = new(StringComparer.Ordinal);
             private readonly Dictionary<string, decimal> _clientOrderPrices = new(StringComparer.Ordinal);
+            private readonly HashSet<string> _pendingCancelClientOrderIds = new(StringComparer.Ordinal);
 
             public QuantowerTradingGateway(MarketMakingStrategy owner)
             {
@@ -807,7 +808,12 @@ namespace Quantower.Strategies
 
                 if (replaceOrderId != null)
                 {
-                    CancelInternal(replaceOrderId);
+                    bool wasTracked = _openClientOrderIds.Contains(replaceOrderId);
+                    bool cancelled = CancelInternal(replaceOrderId);
+                    if (wasTracked && !cancelled)
+                    {
+                        throw new InvalidOperationException($"Cancel pending for order {replaceOrderId}.");
+                    }
                 }
 
                 string clientOrderId = CreateClientOrderId();
@@ -897,9 +903,6 @@ namespace Quantower.Strategies
                 {
                     CancelInternal(clientId);
                 }
-                _openClientOrderIds.Clear();
-                _clientOrderSides.Clear();
-                _clientOrderPrices.Clear();
             }
 
             private string CreateClientOrderId()
@@ -907,20 +910,21 @@ namespace Quantower.Strategies
                 return "GMM-" + Guid.NewGuid().ToString("N");
             }
 
-            private void CancelInternal(string clientOrderId)
+            private bool CancelInternal(string clientOrderId)
             {
-                _openClientOrderIds.Remove(clientOrderId);
+                if (string.IsNullOrEmpty(clientOrderId))
+                {
+                    return false;
+                }
 
                 bool hasSide = _clientOrderSides.TryGetValue(clientOrderId, out var side);
-                _clientOrderSides.Remove(clientOrderId);
-
                 bool hasPrice = _clientOrderPrices.TryGetValue(clientOrderId, out var price);
-                _clientOrderPrices.Remove(clientOrderId);
 
                 var orders = Core.Instance.Orders?.ToArray();
                 if (orders == null || orders.Length == 0)
                 {
-                    return;
+                    LogPendingCancel(clientOrderId);
+                    return false;
                 }
 
                 IOrder? matched = null;
@@ -972,11 +976,29 @@ namespace Quantower.Strategies
                     try
                     {
                         Core.Instance.CancelOrder(matched);
+                        _openClientOrderIds.Remove(clientOrderId);
+                        _clientOrderSides.Remove(clientOrderId);
+                        _clientOrderPrices.Remove(clientOrderId);
+                        _pendingCancelClientOrderIds.Remove(clientOrderId);
+                        return true;
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Ignore cancellation failures.
+                        _owner.Log($"Failed to cancel order {clientOrderId}: {ex.Message}", StrategyLoggingLevel.Trading);
                     }
+                }
+
+                LogPendingCancel(clientOrderId);
+                return false;
+            }
+
+            private void LogPendingCancel(string clientOrderId)
+            {
+                if (_pendingCancelClientOrderIds.Add(clientOrderId))
+                {
+                    _owner.Log(
+                        $"Cancel pending for order {clientOrderId}; awaiting platform acknowledgement.",
+                        StrategyLoggingLevel.Trading);
                 }
             }
 
