@@ -467,8 +467,27 @@ namespace TrueMarketMaking
                     }
                     break;
 
+                case SideState.AwaitingAck:
+                    if (blockNewPlaces)
+                    {
+                        D($"STEP {side} CANCEL (blocked awaiting ack)");
+                        state[side] = SideState.Cancelling;
+                        TryCancel(side);
+                        lastAckTime[side] = DateTime.UtcNow;
+                    }
+                    break;
+
                 case SideState.Working:
                 {
+                    if (blockNewPlaces)
+                    {
+                        D($"STEP {side} CANCEL (blocked) cur={F2(workingPrice[side])}");
+                        state[side] = SideState.Cancelling;
+                        TryCancel(side);
+                        lastAckTime[side] = DateTime.UtcNow;
+                        break;
+                    }
+
                     var cur = workingPrice[side];
                     int deltaTicks = (int)Math.Abs(Math.Round((targetPrice - cur) / tick));
                     bool movedBeyondBand = deltaTicks >= dynRestBandTicks;
