@@ -1,0 +1,420 @@
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using TradingPlatform.BusinessLayer;
+
+namespace TrueMarketMaking
+{
+    public class TrueMarketMaking_Scaling : Strategy
+    {
+        // ===== Core inputs (MES-friendly) =====
+        [InputParameter("Symbol", 10)] private Symbol symbol;
+        [InputParameter("Account", 20)] public Account account;
+
+        // --- Quoting size (scaling) ---
+        [InputParameter("Base contracts (per side)", 30, 1, 1000, 1, 0)]
+        public int baseContracts = 1;
+
+        [InputParameter("Max contracts (per side)", 31, 1, 1000, 1, 0)]
+        public int maxContracts = 3;
+
+        [InputParameter("Inventory band (±contracts)", 32, 0, 100, 1, 0)]
+        public int invBand = 2; // no scaling inside the band
+
+        [InputParameter("Scale qty slope (contracts/step)", 33, 0, 10, 1, 0)]
+        public int scaleQtySlope = 1; // add this many contracts per step outside band
+
+        // --- Spread / base & queue ---
+        [InputParameter("Base half-spread (ticks)", 40, 1, 50, 1, 0)]
+        public int baseHalfTicks = 2;
+
+        [InputParameter("Queue behind ticks", 41, 0, 10, 1, 0)]
+        public int queueBehindTicks = 1;
+
+        [InputParameter("Refresh (ms)", 50, 50, 5000, 50, 0)]
+        public int refreshMs = 800;
+
+        [InputParameter("Force requote (ms, 0=off)", 62, 0, 600000, 100, 0)]
+        public int forceRequoteMs = 60000;
+
+        [InputParameter("Ack timeout (ms)", 63, 500, 20000, 100, 0)]
+        public int ackTimeoutMs = 4000;
+
+        [InputParameter("Time in force", 64)]
+        public TimeInForce timeInForce = TimeInForce.GTC;
+
+        [InputParameter("Use polling ack fallback", 65)]
+        public bool usePollingAckFallback = true;
+
+        // --- Volatility booster (simple) ---
+        [InputParameter("Vol window (sec)", 70, 5, 600, 1, 0)]
+        public int volWindowSec = 60;
+
+        [InputParameter("Vol boost factor", 71, 0.0, 5.0, 0.1, 1)]
+        public double volBoost = 0.6;
+
+        [InputParameter("Max vol boost (ticks)", 72, 0, 10, 1, 0)]
+        public int maxVolBoostTicks = 3;
+
+        // --- Dynamic resting from volatility ---
+        [InputParameter("Min rest fast (ms)", 66, 1000, 60000, 100, 0)]
+        public int minRestFastMs = 6000;      // used in high vol
+
+        [InputParameter("Min rest slow (ms)", 67, 1000, 60000, 100, 0)]
+        public int minRestSlowMs = 20000;     // used in low vol
+
+        [InputParameter("Rest band min (ticks)", 68, 1, 20, 1, 0)]
+        public int restBandMin = 4;           // low vol → smaller band
+
+        [InputParameter("Rest band max (ticks)", 69, 1, 20, 1, 0)]
+        public int restBandMax = 8;           // high vol → larger band
+
+        [InputParameter("Vol low ref (ticks)", 73, 0, 20, 1, 0)]
+        public int volRefLow = 1;
+
+        [InputParameter("Vol high ref (ticks)", 74, 1, 20, 1, 0)]
+        public int volRefHigh = 6;
+
+        // --- Inventory skew & caps ---
+        [InputParameter("Enable inventory skew", 80)]
+        public bool enableInventory = true;
+
+        [InputParameter("Net position (manual, contracts)", 81, -1000, 1000, 1, 0)]
+        public int netPosition = 0;
+
+        [InputParameter("Inventory cap (±contracts)", 83, 1, 200, 1, 0)]
+        public int invCap = 6;
+
+        [InputParameter("Max inventory skew (ticks)", 84, 0, 10, 1, 0)]
+        public int invMaxSkewTicks = 2;
+
+        // --- Commission-aware floor ---
+        [InputParameter("Commission per side (USD)", 90, 0.0, 10.0, 0.05, 2)]
+        public double commissionPerSide = 0.80; // MES typical retail ~0.7–1.0
+
+        [InputParameter("Tick $ value (USD)", 91, 0.01, 50.0, 0.01, 2)]
+        public double tickDollarValue = 1.25; // MES tick value
+
+        [InputParameter("Break-even buffer (ticks)", 92, 0, 4, 1, 0)]
+        public int beBufferTicks = 1; // margin above pure B/E
+
+        [InputParameter("Debug logs", 5)]
+        public bool debugLogs = false;
+
+        public override string[] MonitoringConnectionsIds => new[] { this.symbol?.ConnectionId };
+
+        // ===== State machine =====
+        private enum SideState { Idle, AwaitingAck, Working, Cancelling }
+        private readonly Dictionary<Side, SideState> state = new()
+        {
+            { Side.Buy,  SideState.Idle },
+            { Side.Sell, SideState.Idle }
+        };
+        private readonly Dictionary<Side, string> orderIdBySide = new() { { Side.Buy, null }, { Side.Sell, null } };
+        private readonly Dictionary<Side, DateTime> lastPlaceReqTime = new() { { Side.Buy, DateTime.MinValue }, { Side.Sell, DateTime.MinValue } };
+        private readonly Dictionary<Side, DateTime> lastAckTime = new() { { Side.Buy, DateTime.MinValue }, { Side.Sell, DateTime.MinValue } };
+        private readonly Dictionary<Side, double> workingPrice = new() { { Side.Buy, double.NaN }, { Side.Sell, double.NaN } };
+
+        // Vol window
+        private struct MidSample { public DateTime Time; public double Price; }
+        private readonly Queue<MidSample> mids = new();
+
+        private DateTime lastLoop = DateTime.MinValue;
+
+        public TrueMarketMaking_Scaling()
+        {
+            this.Name = "TrueMarketMaking (MES v2 Scaling+BE+DynRest)";
+            this.Description = "MES MM: commission-aware floor, scaling size, dynamic resting from volatility.";
+        }
+
+        protected override void OnRun()
+        {
+            if (symbol == null || account == null || symbol.ConnectionId != account.ConnectionId)
+            {
+                Log("Set Symbol & Account on same connection.", StrategyLoggingLevel.Error);
+                return;
+            }
+
+            symbol = Core.GetSymbol(symbol.CreateInfo());
+            if (symbol == null)
+            {
+                Log("Symbol not found.", StrategyLoggingLevel.Error);
+                return;
+            }
+
+            symbol.NewQuote += OnQuote;
+            Core.Instance.OrderAdded += OnOrderAdded;
+            Core.Instance.OrderRemoved += OnOrderRemoved;
+
+            Log($"Started {symbol.Name} on {account.Name}", StrategyLoggingLevel.Trading);
+        }
+
+        protected override void OnStop()
+        {
+            if (symbol != null) symbol.NewQuote -= OnQuote;
+            Core.Instance.OrderAdded -= OnOrderAdded;
+            Core.Instance.OrderRemoved -= OnOrderRemoved;
+
+            TryCancel(Side.Buy);
+            TryCancel(Side.Sell);
+            Log("Stopped", StrategyLoggingLevel.Trading);
+        }
+
+        // =================== Main loop ===================
+        private void OnQuote(Symbol s, Quote q)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - lastLoop).TotalMilliseconds < refreshMs) return;
+            lastLoop = now;
+
+            if (s.Bid <= 0 || s.Ask <= 0) return;
+
+            double tick = s.TickSize > 0 ? s.TickSize : 0.25; // MES default tick
+            double mid = (s.Bid + s.Ask) * 0.5;
+
+            // Update vol window & estimate current ticks volatility
+            PushMid(now, mid, TimeSpan.FromSeconds(Math.Max(5, volWindowSec)));
+            int volTicks = EstimateVolatilityTicks(tick);
+            int volBoostTicks = Math.Min(maxVolBoostTicks, (int)Math.Ceiling(volTicks * volBoost));
+
+            // Commission-aware minimum half-spread (floor)
+            double ticksBE = tickDollarValue > 0 ? (2.0 * commissionPerSide) / tickDollarValue : 0.0;
+            int beHalfFloor = (int)Math.Ceiling(0.5 * ticksBE) + beBufferTicks;
+
+            int halfTicks = Math.Max(baseHalfTicks, beHalfFloor) + volBoostTicks;
+
+            // Inventory skew (tilt price)
+            int invSkewTicks = 0;
+            if (enableInventory && invBand > 0)
+            {
+                if (Math.Abs(netPosition) >= invCap)
+                    invSkewTicks = netPosition > 0 ? +invMaxSkewTicks : -invMaxSkewTicks;
+                else
+                {
+                    int sign = Math.Sign(netPosition);
+                    int mag = Math.Max(0, Math.Abs(netPosition) - invBand);
+                    invSkewTicks = Math.Clamp(sign * mag, -invMaxSkewTicks, +invMaxSkewTicks);
+                }
+            }
+
+            // Target ticks & prices
+            int bidTicksAdj = +invSkewTicks; // long -> widen bid; short -> tighten bid
+            int askTicksAdj = -invSkewTicks; // long -> tighten ask; short -> widen ask
+
+            int bidTicks = Math.Max(1, halfTicks + queueBehindTicks + bidTicksAdj);
+            int askTicks = Math.Max(1, halfTicks + queueBehindTicks + askTicksAdj);
+
+            double buyPx = RoundToTick(mid - bidTicks * tick, tick);
+            double sellPx = RoundToTick(mid + askTicks * tick, tick);
+
+            // Dynamic resting based on volatility
+            double volNorm = 0.0;
+            if (volRefHigh > volRefLow)
+                volNorm = Math.Clamp((double)(volTicks - volRefLow) / (volRefHigh - volRefLow), 0.0, 1.0);
+
+            int dynRestBandTicks = (int)Math.Round(restBandMin + (restBandMax - restBandMin) * volNorm);
+            int dynMinRestMs = (int)Math.Round(minRestSlowMs - (minRestSlowMs - minRestFastMs) * volNorm);
+
+            // Position caps block new placements
+            bool blockBuy = enableInventory && netPosition >= invCap;
+            bool blockSell = enableInventory && netPosition <= -invCap;
+
+            // Scaling size (exit side quotes larger)
+            int buyQtyContracts = ComputeSideContracts(Side.Buy);
+            int sellQtyContracts = ComputeSideContracts(Side.Sell);
+
+            StepSide(Side.Buy, buyPx, now, tick, blockBuy, buyQtyContracts, dynRestBandTicks, dynMinRestMs);
+            StepSide(Side.Sell, sellPx, now, tick, blockSell, sellQtyContracts, dynRestBandTicks, dynMinRestMs);
+
+            if (debugLogs)
+                Log($"vol={volTicks}→half={halfTicks}(floor {beHalfFloor}) | inv={netPosition} skew={invSkewTicks} | restBand={dynRestBandTicks} minRest={dynMinRestMs} | qB={buyQtyContracts} qS={sellQtyContracts}",
+                    StrategyLoggingLevel.Trading);
+        }
+
+        private int ComputeSideContracts(Side side)
+        {
+            int sign = Math.Sign(netPosition);
+            bool isExitSide = (sign > 0 && side == Side.Sell) || (sign < 0 && side == Side.Buy);
+
+            if (!isExitSide)
+                return Math.Clamp(baseContracts, 1, maxContracts);
+
+            int outside = Math.Max(0, Math.Abs(netPosition) - invBand);
+            int scaled = baseContracts + outside * Math.Max(0, scaleQtySlope);
+            return Math.Clamp(scaled, 1, maxContracts);
+        }
+
+        private void StepSide(
+            Side side, double targetPrice, DateTime now, double tick, bool blockNewPlaces, int contractsForThisSide,
+            int dynRestBandTicks, int dynMinRestMs)
+        {
+            double sinceAck = (now - lastAckTime[side]).TotalMilliseconds;
+            double sincePlace = (now - lastPlaceReqTime[side]).TotalMilliseconds;
+
+            // Polling fallback
+            if (usePollingAckFallback && state[side] == SideState.AwaitingAck && sincePlace > ackTimeoutMs / 2)
+            {
+                var live = FindLiveOnSide(side);
+                if (live != null)
+                {
+                    orderIdBySide[side] = live.Id;
+                    workingPrice[side] = live.Price;
+                    lastAckTime[side] = now;
+                    state[side] = SideState.Working;
+                }
+                else if (sincePlace > ackTimeoutMs && !blockNewPlaces)
+                {
+                    Place(side, targetPrice, contractsForThisSide);
+                    lastPlaceReqTime[side] = now;
+                    return;
+                }
+            }
+
+            bool forceRequote = (forceRequoteMs > 0) && (sinceAck >= forceRequoteMs);
+
+            switch (state[side])
+            {
+                case SideState.Idle:
+                    if (!blockNewPlaces)
+                    {
+                        Place(side, targetPrice, contractsForThisSide);
+                        state[side] = SideState.AwaitingAck;
+                        lastPlaceReqTime[side] = now;
+                        lastAckTime[side] = now;
+                    }
+                    break;
+
+                case SideState.Working:
+                    {
+                        var cur = workingPrice[side];
+                        int deltaTicks = (int)Math.Abs(Math.Round((targetPrice - cur) / tick));
+                        bool movedBeyondBand = deltaTicks >= dynRestBandTicks;
+                        bool oldEnough = sinceAck >= dynMinRestMs;
+
+                        if ((movedBeyondBand && oldEnough) || forceRequote)
+                        {
+                            state[side] = SideState.Cancelling;
+                            TryCancel(side);
+                            lastAckTime[side] = now;
+                        }
+                        break;
+                    }
+
+                case SideState.Cancelling:
+                    if (sinceAck > ackTimeoutMs)
+                    {
+                        TryCancel(side);
+                        lastAckTime[side] = now;
+                    }
+                    break;
+            }
+        }
+
+        // =================== Trading ops ===================
+        private void Place(Side side, double price, int contractsForThisSide)
+        {
+            double step = symbol.LotStep > 0 ? symbol.LotStep : 1.0; // futures
+            double minLot = symbol.MinLot > 0 ? symbol.MinLot : 1.0;
+            double qty = Math.Max(minLot, Math.Round(contractsForThisSide / step) * step);
+
+            var req = new PlaceOrderRequestParameters()
+            {
+                Account = account,
+                Symbol = symbol,
+                Side = side,
+                Price = price,
+                Quantity = qty,
+                TimeInForce = timeInForce,
+                OrderTypeId = OrderType.Limit
+            };
+
+            var res = Core.Instance.PlaceOrder(req);
+            Log($"Place {side} {qty} @ {price} -> {res}", StrategyLoggingLevel.Trading);
+        }
+
+        private void TryCancel(Side side)
+        {
+            var id = orderIdBySide[side];
+            var ord = !string.IsNullOrEmpty(id) ? Core.Instance.GetOrderById(id, symbol.ConnectionId) : null;
+
+            if (ord != null)
+            {
+                try { Core.Instance.CancelOrder((IOrder)ord); } catch { }
+                return;
+            }
+
+            var arr = Core.Instance.Orders
+                .Where(o => o != null && o.Symbol == this.symbol && o.Account == this.account && o.Side == side)
+                .ToArray();
+
+            foreach (var o in arr)
+                try { Core.Instance.CancelOrder((IOrder)o); } catch { }
+        }
+
+        // =================== Events ===================
+        private void OnOrderAdded(Order o)
+        {
+            if (!IsOurs(o)) return;
+
+            var side = o.Side;
+            orderIdBySide[side] = o.Id;
+            workingPrice[side] = o.Price;
+            lastAckTime[side] = DateTime.UtcNow;
+            state[side] = SideState.Working;
+
+            if (debugLogs) Log($"ACK {side} added Id={o.Id} px={o.Price}", StrategyLoggingLevel.Trading);
+        }
+
+        private void OnOrderRemoved(Order o)
+        {
+            if (!IsOurs(o)) return;
+
+            var side = o.Side;
+            if (orderIdBySide[side] == o.Id)
+            {
+                orderIdBySide[side] = null;
+                workingPrice[side] = double.NaN;
+                lastAckTime[side] = DateTime.UtcNow;
+                state[side] = SideState.Idle;
+
+                if (debugLogs) Log($"ACK {side} removed Id={o.Id}", StrategyLoggingLevel.Trading);
+            }
+        }
+
+        private bool IsOurs(Order o)
+        {
+            if (o == null || o.Account == null || o.Symbol == null) return false;
+            return o.Account.Id == account.Id && o.Symbol.Id == symbol.Id;
+        }
+
+        // ===== Helpers =====
+        private static double RoundToTick(double price, double tick) =>
+            tick > 0 ? Math.Round(price / tick) * tick : price;
+
+        private Order FindLiveOnSide(Side side) =>
+            Core.Instance.Orders.FirstOrDefault(o =>
+                o != null && o.Symbol == symbol && o.Account == account && o.Side == side);
+
+        private void PushMid(DateTime t, double price, TimeSpan window)
+        {
+            mids.Enqueue(new MidSample { Time = t, Price = price });
+            var cutoff = t - window;
+            while (mids.Count > 0 && mids.Peek().Time < cutoff) mids.Dequeue();
+        }
+
+        private int EstimateVolatilityTicks(double tick)
+        {
+            if (mids.Count < 2 || tick <= 0) return 0;
+            double sum = 0; int n = 0;
+            MidSample prev = mids.Peek();
+            foreach (var x in mids)
+            {
+                if (x.Time == prev.Time) continue;
+                double dticks = Math.Abs((x.Price - prev.Price) / tick);
+                sum += dticks; n++;
+                prev = x;
+            }
+            return n == 0 ? 0 : (int)Math.Round(sum / n);
+        }
+    }
+}
