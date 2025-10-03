@@ -859,7 +859,18 @@ namespace TrueMarketMaking
 
             try
             {
-                if (a.Id != null && b.Id != null && a.Id.Equals(b.Id)) return true;
+                var aId = a.Id;
+                var bId = b.Id;
+                if (aId != null && bId != null)
+                {
+                    if (aId == bId || aId.Equals(bId)) return true;
+
+                    var aIdStr = aId.ToString();
+                    var bIdStr = bId.ToString();
+                    if (!string.IsNullOrEmpty(aIdStr) && !string.IsNullOrEmpty(bIdStr) &&
+                        string.Equals(aIdStr, bIdStr, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
             }
             catch { }
 
@@ -877,7 +888,18 @@ namespace TrueMarketMaking
 
             try
             {
-                if (a.Id != null && b.Id != null && a.Id.Equals(b.Id)) return true;
+                var aId = a.Id;
+                var bId = b.Id;
+                if (aId != null && bId != null)
+                {
+                    if (aId == bId || aId.Equals(bId)) return true;
+
+                    var aIdStr = aId.ToString();
+                    var bIdStr = bId.ToString();
+                    if (!string.IsNullOrEmpty(aIdStr) && !string.IsNullOrEmpty(bIdStr) &&
+                        string.Equals(aIdStr, bIdStr, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
             }
             catch { }
 
