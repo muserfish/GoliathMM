@@ -459,6 +459,17 @@ namespace TrueMarketMaking
                 case SideState.Idle:
                     if (!blockNewPlaces)
                     {
+                        var live = FindLiveOnSide(side);
+                        if (live != null)
+                        {
+                            orderIdBySide[side] = live.Id;
+                            workingPrice[side] = live.Price;
+                            lastAckTime[side] = DateTime.UtcNow;
+                            state[side] = SideState.Working;
+                            D($"STEP {side} adopt live id={live.Id} px={F2(live.Price)}");
+                            break;
+                        }
+
                         D($"STEP {side} PLACE tgt={F2(targetPrice)} qty={contractsForThisSide}");
                         Place(side, targetPrice, contractsForThisSide);
                         state[side] = SideState.AwaitingAck;
@@ -467,8 +478,27 @@ namespace TrueMarketMaking
                     }
                     break;
 
+                case SideState.AwaitingAck:
+                    if (blockNewPlaces)
+                    {
+                        D($"STEP {side} CANCEL (blocked awaiting ack)");
+                        state[side] = SideState.Cancelling;
+                        TryCancel(side);
+                        lastAckTime[side] = DateTime.UtcNow;
+                    }
+                    break;
+
                 case SideState.Working:
                 {
+                    if (blockNewPlaces)
+                    {
+                        D($"STEP {side} CANCEL (blocked) cur={F2(workingPrice[side])}");
+                        state[side] = SideState.Cancelling;
+                        TryCancel(side);
+                        lastAckTime[side] = DateTime.UtcNow;
+                        break;
+                    }
+
                     var cur = workingPrice[side];
                     int deltaTicks = (int)Math.Abs(Math.Round((targetPrice - cur) / tick));
                     bool movedBeyondBand = deltaTicks >= dynRestBandTicks;
@@ -563,7 +593,7 @@ namespace TrueMarketMaking
                 if (ord != null) { Core.Instance.CancelOrder((IOrder)ord); return; }
 
                 var arr = Core.Instance.Orders
-                    .Where(o => o != null && o.Symbol == this.symbol && o.Account == this.account && o.Side == side)
+                    .Where(o => o != null && IsOurs(o) && o.Side == side)
                     .ToArray();
 
                 foreach (var o in arr) Core.Instance.CancelOrder((IOrder)o);
@@ -626,8 +656,7 @@ namespace TrueMarketMaking
             try
             {
                 var gp = Core.Instance?.Positions?.FirstOrDefault(p =>
-                    p != null && p.Account != null && p.Symbol != null &&
-                    p.Account.Id == this.account.Id && p.Symbol.Id == this.symbol.Id);
+                    p != null && AccountsEqual(p.Account, this.account) && SymbolsEqual(p.Symbol, this.symbol));
                 if (gp != null) return (int)Math.Round(gp.Quantity);
                 else if (debugLogs) D("POS base: no matching position (by Id) — fallback to manual netPosition.");
             }
@@ -640,8 +669,8 @@ namespace TrueMarketMaking
             try
             {
                 var hp = Core.Instance?.Positions?.FirstOrDefault(p =>
-                    p != null && p.Account != null && p.Symbol != null &&
-                    p.Account.Id == this.account.Id && this.hedgeSymbol != null && p.Symbol.Id == this.hedgeSymbol.Id);
+                    p != null && AccountsEqual(p.Account, this.account) &&
+                    this.hedgeSymbol != null && SymbolsEqual(p.Symbol, this.hedgeSymbol));
                 if (hp != null) return (int)Math.Round(hp.Quantity);
                 else if (debugLogs) D("POS hedge: no matching hedge position (by Id).");
             }
@@ -689,8 +718,44 @@ namespace TrueMarketMaking
 
         private bool IsOurs(Order o)
         {
-            if (o == null || o.Account == null || o.Symbol == null) return false;
-            return o.Account.Id == account.Id && o.Symbol.Id == symbol.Id;
+            if (o == null) return false;
+            return AccountsEqual(o.Account, account) && SymbolsEqual(o.Symbol, symbol);
+        }
+
+        private static bool AccountsEqual(Account a, Account b)
+        {
+            if (a == null || b == null) return false;
+            if (ReferenceEquals(a, b)) return true;
+
+            try
+            {
+                if (a.Id != null && b.Id != null && a.Id.Equals(b.Id)) return true;
+            }
+            catch { }
+
+            if (!string.IsNullOrEmpty(a.Name) && !string.IsNullOrEmpty(b.Name) &&
+                string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
+        }
+
+        private static bool SymbolsEqual(Symbol a, Symbol b)
+        {
+            if (a == null || b == null) return false;
+            if (ReferenceEquals(a, b)) return true;
+
+            try
+            {
+                if (a.Id != null && b.Id != null && a.Id.Equals(b.Id)) return true;
+            }
+            catch { }
+
+            if (!string.IsNullOrEmpty(a.Name) && !string.IsNullOrEmpty(b.Name) &&
+                string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
         }
 
         // === Helpers ===
@@ -702,7 +767,7 @@ namespace TrueMarketMaking
             try
             {
                 return Core.Instance.Orders.FirstOrDefault(o =>
-                    o != null && o.Symbol == symbol && o.Account == account && o.Side == side);
+                    o != null && IsOurs(o) && o.Side == side);
             }
             catch { return null; }
         }
