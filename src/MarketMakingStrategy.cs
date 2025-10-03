@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -328,29 +329,73 @@ namespace Quantower.Strategies
             return normalized * _config.TickSize;
         }
 
+        private static readonly TimeSpan QuoteRetryDelay = TimeSpan.FromMilliseconds(50);
+
         private async Task EnsureQuoteAsync(OrderSide side, decimal price, decimal quantity, CancellationToken cancellationToken)
         {
-            QuoteState snapshot;
-            lock (_syncRoot)
+            int attempts = Math.Max(1, _config.MaxRequoteAttempts);
+            Exception? lastError = null;
+
+            for (int attempt = 1; attempt <= attempts; attempt++)
             {
-                snapshot = _state;
+                cancellationToken.ThrowIfCancellationRequested();
+
+                QuoteState snapshot;
+                lock (_syncRoot)
+                {
+                    snapshot = _state;
+                }
+
+                string? existingOrderId = side == OrderSide.Buy ? snapshot.BidOrderId : snapshot.AskOrderId;
+                decimal existingPrice = side == OrderSide.Buy ? snapshot.BidPrice : snapshot.AskPrice;
+
+                if (existingOrderId != null && existingPrice == price)
+                {
+                    return;
+                }
+
+                try
+                {
+                    OrderTicket ticket = await _gateway
+                        .PlaceOrReplaceAsync(_config.Symbol, side, price, quantity, existingOrderId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    lock (_syncRoot)
+                    {
+                        _state = _state.With(side, ticket.OrderId, price);
+                    }
+
+                    return;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    Trace.TraceWarning(
+                        $"[{nameof(MarketMakingEngine)}] Failed to {(existingOrderId == null ? "place" : "replace")} {side} quote (attempt {attempt}/{attempts}): {ex.Message}");
+
+                    if (existingOrderId != null)
+                    {
+                        lock (_syncRoot)
+                        {
+                            _state = _state.Without(side);
+                        }
+                    }
+
+                    if (attempt < attempts)
+                    {
+                        await Task.Delay(QuoteRetryDelay, cancellationToken).ConfigureAwait(false);
+                    }
+                }
             }
 
-            string? existingOrderId = side == OrderSide.Buy ? snapshot.BidOrderId : snapshot.AskOrderId;
-            decimal existingPrice = side == OrderSide.Buy ? snapshot.BidPrice : snapshot.AskPrice;
-
-            if (existingOrderId != null && existingPrice == price)
+            if (lastError != null)
             {
-                return;
-            }
-
-            OrderTicket ticket = await _gateway
-                .PlaceOrReplaceAsync(_config.Symbol, side, price, quantity, existingOrderId, cancellationToken)
-                .ConfigureAwait(false);
-
-            lock (_syncRoot)
-            {
-                _state = _state.With(side, ticket.OrderId, price);
+                Trace.TraceError(
+                    $"[{nameof(MarketMakingEngine)}] Exhausted quote retries for {side}: {lastError.Message}");
             }
         }
 
@@ -429,6 +474,13 @@ namespace Quantower.Strategies
                 return side == OrderSide.Buy
                     ? new QuoteState(orderId, price, AskOrderId, AskPrice)
                     : new QuoteState(BidOrderId, BidPrice, orderId, price);
+            }
+
+            public QuoteState Without(OrderSide side)
+            {
+                return side == OrderSide.Buy
+                    ? new QuoteState(null, 0m, AskOrderId, AskPrice)
+                    : new QuoteState(BidOrderId, BidPrice, null, 0m);
             }
         }
     }
