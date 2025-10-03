@@ -97,6 +97,7 @@ namespace TrueMarketMaking
         private Dictionary<Side, DateTime> lastPlaceReqTime;
         private Dictionary<Side, DateTime> lastAckTime;
         private Dictionary<Side, double> workingPrice;
+        private HashSet<string> quoteOrderIds;
 
         private struct MidSample { public DateTime Time; public double Price; }
         private Queue<MidSample> mids;
@@ -152,6 +153,13 @@ namespace TrueMarketMaking
             return double.NaN;
         }
 
+        private static int GetOrderQtyRounded(Order o)
+        {
+            double qty = GetOrderQtySafe(o);
+            if (double.IsNaN(qty) || double.IsInfinity(qty)) return 0;
+            return (int)Math.Round(qty);
+        }
+
         public TrueMarketMaking_v4_GenericAuto()
         {
             this.Name = "TrueMarketMaking v4 (Generic+KnownTick+StepHedge+Throttles)";
@@ -166,6 +174,7 @@ namespace TrueMarketMaking
             lastPlaceReqTime = new Dictionary<Side, DateTime> { { Side.Buy, DateTime.MinValue }, { Side.Sell, DateTime.MinValue } };
             lastAckTime = new Dictionary<Side, DateTime> { { Side.Buy, DateTime.MinValue }, { Side.Sell, DateTime.MinValue } };
             workingPrice = new Dictionary<Side, double> { { Side.Buy, double.NaN }, { Side.Sell, double.NaN } };
+            quoteOrderIds = new HashSet<string>(StringComparer.Ordinal);
             mids = new Queue<MidSample>();
 
             if (symbol == null || account == null || symbol.ConnectionId != account.ConnectionId)
@@ -196,6 +205,37 @@ namespace TrueMarketMaking
             Core.Instance.OrderRemoved += OnOrderRemoved;
 
             Log($"Started {symbol.Name} on {account.Name}", StrategyLoggingLevel.Trading);
+
+            AdoptExistingQuotes();
+        }
+
+        private void AdoptExistingQuotes()
+        {
+            try
+            {
+                foreach (var side in new[] { Side.Buy, Side.Sell })
+                {
+                    if (state[side] != SideState.Idle) continue;
+
+                    var ours = Core.Instance?.Orders?
+                        .Where(o => o != null && IsOurs(o) && o.Side == side)
+                        .ToArray();
+
+                    if (ours == null || ours.Length != 1) continue;
+
+                    var live = ours[0];
+                    int desired = ComputeSideContracts(side);
+                    if (desired > 0 && GetOrderQtyRounded(live) != desired) continue;
+
+                    quoteOrderIds.Add(live.Id);
+                    orderIdBySide[side] = live.Id;
+                    workingPrice[side] = live.Price;
+                    lastAckTime[side] = DateTime.UtcNow;
+                    state[side] = SideState.Working;
+                    D($"INIT adopt side={side} id={live.Id} px={F2(live.Price)} qty={GetOrderQtyRounded(live)}");
+                }
+            }
+            catch { }
         }
 
         protected override void OnStop()
@@ -432,18 +472,19 @@ namespace TrueMarketMaking
             double sinceAck = (now - lastAckTime[side]).TotalMilliseconds;
             double sincePlace = (now - lastPlaceReqTime[side]).TotalMilliseconds;
 
+            bool allowAdopt = state[side] == SideState.Idle || state[side] == SideState.AwaitingAck;
+            var live = GetQuoteOrder(side, allowAdopt, contractsForThisSide);
+
+            if (state[side] == SideState.AwaitingAck && live != null)
+            {
+                state[side] = SideState.Working;
+                lastAckTime[side] = DateTime.UtcNow;
+                D($"STEP {side} fallback->Working id={live.Id} px={F2(live.Price)} qty={GetOrderQtyRounded(live)}");
+            }
+
             if (usePollingAckFallback && state[side] == SideState.AwaitingAck && sincePlace > ackTimeoutMs / 2)
             {
-                var live = FindLiveOnSide(side);
-                if (live != null)
-                {
-                    orderIdBySide[side] = live.Id;
-                    workingPrice[side] = live.Price;
-                    lastAckTime[side] = DateTime.UtcNow;
-                    state[side] = SideState.Working;
-                    D($"STEP {side} fallback->Working id={live.Id} px={F2(live.Price)}");
-                }
-                else if (sincePlace > ackTimeoutMs && !blockNewPlaces)
+                if (live == null && sincePlace > ackTimeoutMs && !blockNewPlaces)
                 {
                     D($"STEP {side} re-place tgt={F2(targetPrice)} qty={contractsForThisSide}");
                     Place(side, targetPrice, contractsForThisSide);
@@ -457,19 +498,16 @@ namespace TrueMarketMaking
             switch (state[side])
             {
                 case SideState.Idle:
+                    if (live != null)
+                    {
+                        lastAckTime[side] = DateTime.UtcNow;
+                        state[side] = SideState.Working;
+                        D($"STEP {side} adopt live id={live.Id} px={F2(live.Price)} qty={GetOrderQtyRounded(live)}");
+                        break;
+                    }
+
                     if (!blockNewPlaces)
                     {
-                        var live = FindLiveOnSide(side);
-                        if (live != null)
-                        {
-                            orderIdBySide[side] = live.Id;
-                            workingPrice[side] = live.Price;
-                            lastAckTime[side] = DateTime.UtcNow;
-                            state[side] = SideState.Working;
-                            D($"STEP {side} adopt live id={live.Id} px={F2(live.Price)}");
-                            break;
-                        }
-
                         D($"STEP {side} PLACE tgt={F2(targetPrice)} qty={contractsForThisSide}");
                         Place(side, targetPrice, contractsForThisSide);
                         state[side] = SideState.AwaitingAck;
@@ -490,16 +528,34 @@ namespace TrueMarketMaking
 
                 case SideState.Working:
                 {
+                    if (live == null)
+                    {
+                        orderIdBySide[side] = null;
+                        workingPrice[side] = double.NaN;
+                        state[side] = SideState.Idle;
+                        break;
+                    }
+
                     if (blockNewPlaces)
                     {
-                        D($"STEP {side} CANCEL (blocked) cur={F2(workingPrice[side])}");
+                        D($"STEP {side} CANCEL (blocked) cur={F2(live.Price)}");
                         state[side] = SideState.Cancelling;
                         TryCancel(side);
                         lastAckTime[side] = DateTime.UtcNow;
                         break;
                     }
 
-                    var cur = workingPrice[side];
+                    int liveQty = GetOrderQtyRounded(live);
+                    if (contractsForThisSide > 0 && liveQty != contractsForThisSide)
+                    {
+                        D($"STEP {side} CANCEL qty={liveQty} -> target={contractsForThisSide}");
+                        state[side] = SideState.Cancelling;
+                        TryCancel(side);
+                        lastAckTime[side] = DateTime.UtcNow;
+                        break;
+                    }
+
+                    double cur = live.Price;
                     int deltaTicks = (int)Math.Abs(Math.Round((targetPrice - cur) / tick));
                     bool movedBeyondBand = deltaTicks >= dynRestBandTicks;
                     bool oldEnough = (now - lastAckTime[side]).TotalMilliseconds >= dynMinRestMs;
@@ -590,13 +646,28 @@ namespace TrueMarketMaking
             {
                 var id = orderIdBySide[side];
                 var ord = !string.IsNullOrEmpty(id) ? Core.Instance.GetOrderById(id, symbol.ConnectionId) : null;
-                if (ord != null) { Core.Instance.CancelOrder((IOrder)ord); return; }
+                if (ord != null)
+                {
+                    Core.Instance.CancelOrder((IOrder)ord);
+                    return;
+                }
 
-                var arr = Core.Instance.Orders
+                var tracked = Core.Instance.Orders?
+                    .Where(o => o != null && IsOurs(o) && o.Side == side && quoteOrderIds.Contains(o.Id))
+                    .ToArray();
+
+                if (tracked != null && tracked.Length > 0)
+                {
+                    foreach (var o in tracked) Core.Instance.CancelOrder((IOrder)o);
+                    return;
+                }
+
+                var fallback = Core.Instance.Orders?
                     .Where(o => o != null && IsOurs(o) && o.Side == side)
                     .ToArray();
 
-                foreach (var o in arr) Core.Instance.CancelOrder((IOrder)o);
+                if (fallback != null)
+                    foreach (var o in fallback) Core.Instance.CancelOrder((IOrder)o);
             }
             catch { }
         }
@@ -696,16 +767,20 @@ namespace TrueMarketMaking
         private void OnOrderAdded(Order o)
         {
             if (!IsOurs(o)) return;
+            if (state[o.Side] != SideState.AwaitingAck) return;
+
             orderIdBySide[o.Side] = o.Id;
+            quoteOrderIds.Add(o.Id);
             workingPrice[o.Side] = o.Price;
             lastAckTime[o.Side] = DateTime.UtcNow;
             state[o.Side] = SideState.Working;
-            D($"ORD add side={o.Side} id={o.Id} px={F2(o.Price)} qty={GetOrderQtySafe(o)}");
+            D($"ORD add side={o.Side} id={o.Id} px={F2(o.Price)} qty={GetOrderQtyRounded(o)}");
         }
 
         private void OnOrderRemoved(Order o)
         {
             if (!IsOurs(o)) return;
+            quoteOrderIds.Remove(o.Id);
             if (orderIdBySide[o.Side] == o.Id)
             {
                 orderIdBySide[o.Side] = null;
@@ -719,7 +794,62 @@ namespace TrueMarketMaking
         private bool IsOurs(Order o)
         {
             if (o == null) return false;
-            return AccountsEqual(o.Account, account) && SymbolsEqual(o.Symbol, symbol);
+            if (!AccountsEqual(o.Account, account) || !SymbolsEqual(o.Symbol, symbol)) return false;
+
+            bool sawMetadata = false;
+
+            try
+            {
+                var type = o.GetType();
+
+                foreach (var name in new[] { "Strategy", "OwnerStrategy", "StrategyObject" })
+                {
+                    var prop = type.GetProperty(name);
+                    if (prop == null) continue;
+                    sawMetadata = true;
+
+                    var val = prop.GetValue(o);
+                    if (val == null) continue;
+
+                    if (ReferenceEquals(val, this)) return true;
+                    return false;
+                }
+
+                foreach (var name in new[] { "StrategyId", "StrategyID", "StrategyGuid" })
+                {
+                    var prop = type.GetProperty(name);
+                    if (prop == null) continue;
+                    sawMetadata = true;
+
+                    var val = prop.GetValue(o)?.ToString();
+                    if (string.IsNullOrEmpty(val)) continue;
+
+                    var myIdProp = this.GetType().GetProperty("Id");
+                    var myId = myIdProp?.GetValue(this)?.ToString();
+                    if (!string.IsNullOrEmpty(myId))
+                        return string.Equals(val, myId, StringComparison.OrdinalIgnoreCase);
+
+                    return false;
+                }
+
+                foreach (var name in new[] { "StrategyName", "Strategy" })
+                {
+                    var prop = type.GetProperty(name);
+                    if (prop == null || prop.PropertyType != typeof(string)) continue;
+                    sawMetadata = true;
+
+                    var val = prop.GetValue(o) as string;
+                    if (string.IsNullOrEmpty(val)) continue;
+
+                    if (!string.IsNullOrEmpty(this.Name) && string.Equals(val, this.Name, StringComparison.OrdinalIgnoreCase))
+                        return true;
+
+                    return false;
+                }
+            }
+            catch { }
+
+            return !sawMetadata;
         }
 
         private static bool AccountsEqual(Account a, Account b)
@@ -762,14 +892,71 @@ namespace TrueMarketMaking
         private static double RoundToTick(double price, double tick) =>
             tick > 0 ? Math.Round(price / tick) * tick : price;
 
-        private Order FindLiveOnSide(Side side)
+        private Order GetQuoteOrder(Side side, bool allowAdopt, int expectedQty)
         {
+            Order live = null;
+
             try
             {
-                return Core.Instance.Orders.FirstOrDefault(o =>
-                    o != null && IsOurs(o) && o.Side == side);
+                var id = orderIdBySide[side];
+                if (!string.IsNullOrEmpty(id))
+                {
+                    try
+                    {
+                        live = Core.Instance.GetOrderById(id, symbol?.ConnectionId);
+                        if (live == null || !IsOurs(live) || live.Side != side)
+                        {
+                            quoteOrderIds.Remove(id);
+                            orderIdBySide[side] = null;
+                            workingPrice[side] = double.NaN;
+                            live = null;
+                        }
+                    }
+                    catch
+                    {
+                        quoteOrderIds.Remove(id);
+                        orderIdBySide[side] = null;
+                        workingPrice[side] = double.NaN;
+                    }
+                }
+
+                if (live == null)
+                {
+                    var tracked = Core.Instance.Orders?
+                        .Where(o => o != null && IsOurs(o) && o.Side == side && quoteOrderIds.Contains(o.Id))
+                        .ToArray();
+
+                    if (tracked != null && tracked.Length == 1)
+                        live = tracked[0];
+                }
+
+                if (live == null && allowAdopt)
+                {
+                    var ours = Core.Instance.Orders?
+                        .Where(o => o != null && IsOurs(o) && o.Side == side)
+                        .ToArray();
+
+                    if (ours != null && ours.Length == 1)
+                    {
+                        var candidate = ours[0];
+                        int qty = GetOrderQtyRounded(candidate);
+                        if (expectedQty <= 0 || qty == expectedQty)
+                        {
+                            live = candidate;
+                            quoteOrderIds.Add(live.Id);
+                        }
+                    }
+                }
+
+                if (live != null)
+                {
+                    orderIdBySide[side] = live.Id;
+                    workingPrice[side] = live.Price;
+                }
             }
-            catch { return null; }
+            catch { }
+
+            return live;
         }
 
         private void PushMid(DateTime t, double price, TimeSpan window)
