@@ -331,6 +331,17 @@ namespace Quantower.Strategies
 
         private static readonly TimeSpan QuoteRetryDelay = TimeSpan.FromMilliseconds(50);
 
+        private sealed class PendingCancelException : Exception
+        {
+            public PendingCancelException(string orderId)
+                : base($"Cancel pending for order {orderId}.")
+            {
+                OrderId = orderId;
+            }
+
+            public string OrderId { get; }
+        }
+
         private async Task EnsureQuoteAsync(OrderSide side, decimal price, decimal quantity, CancellationToken cancellationToken)
         {
             int attempts = Math.Max(1, _config.MaxRequoteAttempts);
@@ -366,6 +377,12 @@ namespace Quantower.Strategies
                     }
 
                     return;
+                }
+                catch (PendingCancelException)
+                {
+                    await Task.Delay(QuoteRetryDelay, cancellationToken).ConfigureAwait(false);
+                    attempt--;
+                    continue;
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -795,6 +812,9 @@ namespace Quantower.Strategies
             private readonly HashSet<string> _openClientOrderIds = new(StringComparer.Ordinal);
             private readonly Dictionary<string, OrderSide> _clientOrderSides = new(StringComparer.Ordinal);
             private readonly Dictionary<string, decimal> _clientOrderPrices = new(StringComparer.Ordinal);
+            private readonly Dictionary<string, Account> _clientOrderAccounts = new(StringComparer.Ordinal);
+            private readonly Dictionary<string, Symbol> _clientOrderSymbols = new(StringComparer.Ordinal);
+            private readonly HashSet<string> _pendingCancelClientOrderIds = new(StringComparer.Ordinal);
 
             public QuantowerTradingGateway(MarketMakingStrategy owner)
             {
@@ -807,7 +827,12 @@ namespace Quantower.Strategies
 
                 if (replaceOrderId != null)
                 {
+                    bool wasTracked = _openClientOrderIds.Contains(replaceOrderId);
                     CancelInternal(replaceOrderId);
+                    if (wasTracked && _openClientOrderIds.Contains(replaceOrderId))
+                    {
+                        throw new PendingCancelException(replaceOrderId);
+                    }
                 }
 
                 string clientOrderId = CreateClientOrderId();
@@ -829,6 +854,8 @@ namespace Quantower.Strategies
                 _openClientOrderIds.Add(clientOrderId);
                 _clientOrderSides[clientOrderId] = side;
                 _clientOrderPrices[clientOrderId] = price;
+                _clientOrderAccounts[clientOrderId] = request.Account;
+                _clientOrderSymbols[clientOrderId] = request.Symbol;
 
                 return Task.FromResult(new OrderTicket(clientOrderId));
             }
@@ -888,6 +915,14 @@ namespace Quantower.Strategies
                 _openClientOrderIds.Add(clientOrderId);
                 _clientOrderSides[clientOrderId] = side;
                 _clientOrderPrices[clientOrderId] = price;
+                if (account != null)
+                {
+                    _clientOrderAccounts[clientOrderId] = account;
+                }
+                if (hedgeSymbol != null)
+                {
+                    _clientOrderSymbols[clientOrderId] = hedgeSymbol;
+                }
                 return Task.FromResult(new OrderTicket(clientOrderId));
             }
 
@@ -897,9 +932,6 @@ namespace Quantower.Strategies
                 {
                     CancelInternal(clientId);
                 }
-                _openClientOrderIds.Clear();
-                _clientOrderSides.Clear();
-                _clientOrderPrices.Clear();
             }
 
             private string CreateClientOrderId()
@@ -907,20 +939,23 @@ namespace Quantower.Strategies
                 return "GMM-" + Guid.NewGuid().ToString("N");
             }
 
-            private void CancelInternal(string clientOrderId)
+            private bool CancelInternal(string clientOrderId)
             {
-                _openClientOrderIds.Remove(clientOrderId);
+                if (string.IsNullOrEmpty(clientOrderId))
+                {
+                    return false;
+                }
 
                 bool hasSide = _clientOrderSides.TryGetValue(clientOrderId, out var side);
-                _clientOrderSides.Remove(clientOrderId);
-
                 bool hasPrice = _clientOrderPrices.TryGetValue(clientOrderId, out var price);
-                _clientOrderPrices.Remove(clientOrderId);
+                bool hasAccount = _clientOrderAccounts.TryGetValue(clientOrderId, out var account);
+                bool hasSymbol = _clientOrderSymbols.TryGetValue(clientOrderId, out var symbol);
 
                 var orders = Core.Instance.Orders?.ToArray();
                 if (orders == null || orders.Length == 0)
                 {
-                    return;
+                    LogPendingCancel(clientOrderId);
+                    return false;
                 }
 
                 IOrder? matched = null;
@@ -932,8 +967,26 @@ namespace Quantower.Strategies
                         continue;
                     }
 
-                    if (!AccountsEqual(candidate.Account, _owner.TradingAccount!)
-                        || !SymbolsEqual(candidate.Symbol, _owner.TradingSymbol!))
+                    if (hasAccount)
+                    {
+                        if (account != null && !AccountsEqual(candidate.Account, account))
+                        {
+                            continue;
+                        }
+                    }
+                    else if (_owner.TradingAccount != null && !AccountsEqual(candidate.Account, _owner.TradingAccount))
+                    {
+                        continue;
+                    }
+
+                    if (hasSymbol)
+                    {
+                        if (symbol != null && !SymbolsEqual(candidate.Symbol, symbol))
+                        {
+                            continue;
+                        }
+                    }
+                    else if (_owner.TradingSymbol != null && !SymbolsEqual(candidate.Symbol, _owner.TradingSymbol))
                     {
                         continue;
                     }
@@ -972,11 +1025,36 @@ namespace Quantower.Strategies
                     try
                     {
                         Core.Instance.CancelOrder(matched);
+                        _openClientOrderIds.Remove(clientOrderId);
+                        _clientOrderSides.Remove(clientOrderId);
+                        _clientOrderPrices.Remove(clientOrderId);
+                        _clientOrderAccounts.Remove(clientOrderId);
+                        _clientOrderSymbols.Remove(clientOrderId);
+                        _pendingCancelClientOrderIds.Remove(clientOrderId);
+                        return true;
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Ignore cancellation failures.
+                        _owner.Log($"Failed to cancel order {clientOrderId}: {ex.Message}", StrategyLoggingLevel.Trading);
                     }
+                }
+
+                LogPendingCancel(clientOrderId);
+                return false;
+            }
+
+            private void LogPendingCancel(string clientOrderId)
+            {
+                if (!_openClientOrderIds.Contains(clientOrderId))
+                {
+                    return;
+                }
+
+                if (_pendingCancelClientOrderIds.Add(clientOrderId))
+                {
+                    _owner.Log(
+                        $"Cancel pending for order {clientOrderId}; awaiting platform acknowledgement.",
+                        StrategyLoggingLevel.Trading);
                 }
             }
 
