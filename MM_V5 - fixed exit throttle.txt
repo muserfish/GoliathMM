@@ -5,7 +5,7 @@ using TradingPlatform.BusinessLayer;
 
 namespace TrueMarketMaking
 {
-    public class TrueMarketMaking_v4_GenericAuto : Strategy
+    public class TrueMarketMaking_v5_GenericAuto : Strategy
     {
         // === Required ===
         [InputParameter("Symbol", 10)] private Symbol symbol;
@@ -160,9 +160,9 @@ namespace TrueMarketMaking
             return (int)Math.Round(qty);
         }
 
-        public TrueMarketMaking_v4_GenericAuto()
+        public TrueMarketMaking_v5_GenericAuto()
         {
-            this.Name = "TrueMarketMaking v4 (Generic+KnownTick+StepHedge+Throttles)";
+            this.Name = "TrueMarketMaking v5 (Generic+KnownTick+StepHedge+Throttles)";
             this.Description = "MM with DOM tilt, dynamic rest, exit ladder, known-map tick value, step hedging, and exit-only throttles.";
         }
 
