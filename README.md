@@ -2,6 +2,10 @@
 
 A C# market-making strategy prototype built around Quantower's Strategy API. The project explores how two-sided quotes can adapt to **inventory exposure** and **top-of-book order-book imbalance**, with configurable order management and optional hedging.
 
+![GoliathMM strategy architecture](docs/goliathmm-architecture.svg)
+
+*Illustrative architecture diagram — not a live Quantower screenshot.*
+
 ## What the implementation does
 
 - **Two-sided quoting:** calculates bid and ask quotes around a reference price, normally the best-bid/best-ask midpoint.
